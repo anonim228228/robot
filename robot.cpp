@@ -8,16 +8,19 @@
 std::string last_automatic_command;
 std::string last_manual_command;
 std::chrono::steady_clock::time_point last_manual_time;
+std::chrono::steady_clock::time_point last_command_time;
 
 void on_message(struct mosquitto *client, void *userdata, const struct mosquitto_message *message) {
     std::string topic(message->topic);
     std::string payload(static_cast<char*>(message->payload), message->payloadlen);
-    std::cout << "Received message on topic '" << topic << "': " << payload << std::endl;
+    std::cout << "Received command on topic '" << topic << "': " << payload << std::endl;
     if (topic == "robot/automatic_command") {
         last_automatic_command = payload;
+        last_command_time = std::chrono::steady_clock::now();
     } else if (topic == "robot/manual_command") {
         last_manual_command = payload;
         last_manual_time = std::chrono::steady_clock::now();
+        last_command_time = std::chrono::steady_clock::now();
     }
 }
 
@@ -29,7 +32,7 @@ int main() {
         std::cerr << "Failed to create MQTT client" << std::endl;
         return 1;
     }
-    if (mosquitto_connect(mqtt_client, "localhost", 1883, 60) != MOSQ_ERR_SUCCESS) {
+    if (mosquitto_connect(mqtt_client, "192.168.1.100", 1883, 60) != MOSQ_ERR_SUCCESS) { // Replace with your internal IP
         std::cerr << "Failed to connect to MQTT broker" << std::endl;
         mosquitto_destroy(mqtt_client);
         return 1;
@@ -39,29 +42,35 @@ int main() {
     mosquitto_message_callback_set(mqtt_client, on_message);
     mosquitto_loop_start(mqtt_client);
 
-    // Основной цикл для обработки команд
+    // Initialize GPIO for motors (commented for PC testing)
+    /*
+    wiringPiSetup();
+    pinMode(0, OUTPUT);  // Left motor forward
+    pinMode(1, OUTPUT);  // Left motor backward
+    pinMode(2, OUTPUT);  // Right motor forward
+    pinMode(3, OUTPUT);  // Right motor backward
+    */
+
     while (true) {
         auto now = std::chrono::steady_clock::now();
         std::string current_command;
+
+        // Check if manual command is active (within 1 second)
         if (!last_manual_command.empty() && now - last_manual_time < std::chrono::seconds(1)) {
             current_command = last_manual_command;
-        } else {
+        } else if (!last_automatic_command.empty()) {
             current_command = last_automatic_command;
+        } else {
+            current_command = "stop";
         }
 
-        // Вывод текущей команды
-        if (!current_command.empty()) {
-            std::cout << "Processing command: " << current_command << std::endl;
+        // Stop if no new command received for 1 second
+        if (now - last_command_time > std::chrono::seconds(1)) {
+            current_command = "stop";
         }
 
-        // Имитация обработки команд (раскомментируйте для работы с моторами на Raspberry Pi)
+        // Simulate motor control (uncomment for Raspberry Pi)
         /*
-        wiringPiSetup();
-        pinMode(0, OUTPUT);  // Left motor forward
-        pinMode(1, OUTPUT);  // Left motor backward
-        pinMode(2, OUTPUT);  // Right motor forward
-        pinMode(3, OUTPUT);  // Right motor backward
-
         if (current_command == "move_forward" || current_command == "forward") {
             digitalWrite(0, HIGH); digitalWrite(1, LOW);
             digitalWrite(2, HIGH); digitalWrite(3, LOW);
@@ -79,6 +88,13 @@ int main() {
             digitalWrite(2, LOW); digitalWrite(3, HIGH);
         }
         */
+
+        // Clear commands after processing
+        if (!last_manual_command.empty() && now - last_manual_time < std::chrono::seconds(1)) {
+            last_manual_command.clear();
+        } else if (!last_automatic_command.empty()) {
+            last_automatic_command.clear();
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
