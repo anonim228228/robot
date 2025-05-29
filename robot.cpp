@@ -1,107 +1,239 @@
-#include <wiringPi.h>
-#include <mosquitto.h>
 #include <iostream>
 #include <string>
-#include <chrono>
+#include <mosquitto.h>
+#include <mutex>
+#include <vector>
 #include <thread>
+#include <cstring>
+#include <linux/gpio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
-std::string last_automatic_command;
-std::string last_manual_command;
-std::chrono::steady_clock::time_point last_manual_time;
-std::chrono::steady_clock::time_point last_command_time;
+class GPIOController {
+private:
+    std::vector<int> gpio_pins = {12, 13, 6, 20, 21, 26}; // IN1, IN2, ENA, IN3, IN4, ENB
+    int gpio_chip_fd;
+    std::vector<int> pin_handles; // Дескрипторы для каждого пина
 
-void on_message(struct mosquitto *client, void *userdata, const struct mosquitto_message *message) {
-    std::string topic(message->topic);
-    std::string payload(static_cast<char*>(message->payload), message->payloadlen);
-    std::cout << "Received command on topic '" << topic << "': " << payload << std::endl;
-    if (topic == "robot/automatic_command") {
-        last_automatic_command = payload;
-        last_command_time = std::chrono::steady_clock::now();
-    } else if (topic == "robot/manual_command") {
-        last_manual_command = payload;
-        last_manual_time = std::chrono::steady_clock::now();
-        last_command_time = std::chrono::steady_clock::now();
+    void gpio_write(int pin_index, uint8_t value) {
+        if (pin_index < 0 || pin_index >= pin_handles.size()) {
+            std::cerr << "Invalid pin index: " << pin_index << std::endl;
+            return;
+        }
+        struct gpiohandle_data data;
+        data.values[0] = value;
+        if (ioctl(pin_handles[pin_index], GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data) < 0) {
+            std::cerr << "Error setting value for pin " << gpio_pins[pin_index] << ": " << strerror(errno) << std::endl;
+        }
     }
-}
 
-int main() {
-    // Initialize Mosquitto
-    mosquitto_lib_init();
-    struct mosquitto *mqtt_client = mosquitto_new("robot_client", true, nullptr);
-    if (!mqtt_client) {
-        std::cerr << "Failed to create MQTT client" << std::endl;
-        return 1;
+public:
+    GPIOController() : gpio_chip_fd(-1) {
+        gpio_chip_fd = open("/dev/gpiochip0", O_RDWR);
+        if (gpio_chip_fd < 0) {
+            throw std::runtime_error("Failed to open GPIO device: " + std::string(strerror(errno)));
+        }
+
+        pin_handles.resize(gpio_pins.size(), -1);
+        for (size_t i = 0; i < gpio_pins.size(); ++i) {
+            struct gpiohandle_request req;
+            memset(&req, 0, sizeof(req));
+            req.lineoffsets[0] = gpio_pins[i];
+            req.lines = 1;
+            req.flags = GPIOHANDLE_REQUEST_OUTPUT;
+            req.default_values[0] = 0;
+            strcpy(req.consumer_label, "robot_control");
+            if (ioctl(gpio_chip_fd, GPIO_GET_LINEHANDLE_IOCTL, &req) < 0) {
+                std::cerr << "Error setting handle for pin " << gpio_pins[i] << ": " << strerror(errno) << std::endl;
+                continue;
+            }
+            pin_handles[i] = req.fd;
+        }
+        stop();
     }
-    if (mosquitto_connect(mqtt_client, "192.168.1.100", 1883, 60) != MOSQ_ERR_SUCCESS) { // Replace with your internal IP
-        std::cerr << "Failed to connect to MQTT broker" << std::endl;
-        mosquitto_destroy(mqtt_client);
-        return 1;
+
+    ~GPIOController() {
+        stop();
+        for (int handle : pin_handles) {
+            if (handle >= 0) {
+                close(handle);
+            }
+        }
+        if (gpio_chip_fd >= 0) {
+            close(gpio_chip_fd);
+        }
     }
-    mosquitto_subscribe(mqtt_client, nullptr, "robot/automatic_command", 0);
-    mosquitto_subscribe(mqtt_client, nullptr, "robot/manual_command", 0);
-    mosquitto_message_callback_set(mqtt_client, on_message);
-    mosquitto_loop_start(mqtt_client);
 
-    // Initialize GPIO for motors (commented for PC testing)
-    /*
-    wiringPiSetup();
-    pinMode(0, OUTPUT);  // Left motor forward
-    pinMode(1, OUTPUT);  // Left motor backward
-    pinMode(2, OUTPUT);  // Right motor forward
-    pinMode(3, OUTPUT);  // Right motor backward
-    */
+    void forward() {
+        gpio_write(2, 1);   // ENA левый включить
+        gpio_write(5, 1);   // ENB правый включить
+        gpio_write(0, 0);   // IN1 левый вперёд
+        gpio_write(1, 1);   // IN2 левый реверс
+        gpio_write(3, 1);   // IN3 правый реверс
+        gpio_write(4, 0);   // IN4 правый вперёд
+    }
 
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
+    void backward() {
+        gpio_write(2, 1);   // ENA
+        gpio_write(5, 1);   // ENB
+        gpio_write(0, 0);   // IN1
+        gpio_write(1, 1);   // IN2
+        gpio_write(3, 1);   // IN3
+        gpio_write(4, 0);   // IN4
+    }
+
+    void left() {
+        gpio_write(2, 1);   // ENA
+        gpio_write(5, 1);   // ENB
+        gpio_write(0, 0);   // IN1
+        gpio_write(1, 0);   // IN2
+        gpio_write(3, 1);   // IN3
+        gpio_write(4, 0);   // IN4
+    }
+
+    void right() {
+        gpio_write(2, 1);   // ENA
+        gpio_write(5, 1);   // ENB
+        gpio_write(0, 0);   // IN1
+        gpio_write(1, 1);   // IN2
+        gpio_write(3, 0);   // IN3
+        gpio_write(4, 0);   // IN4
+    }
+
+    void stop() {
+        gpio_write(2, 1);   // ENA
+        gpio_write(5, 1);   // ENB
+        gpio_write(0, 0);   // IN1
+        gpio_write(1, 0);   // IN2
+        gpio_write(3, 0);   // IN3
+        gpio_write(4, 0);   // IN4
+    }
+};
+
+class MqttGpioReceiver {
+public:
+    MqttGpioReceiver(const char* host, int port, const char* topic)
+        : mosq_(nullptr), running_(false) {
+        mosquitto_lib_init();
+        mosq_ = mosquitto_new("robot_client", true, this);
+        if (!mosq_) {
+            throw std::runtime_error("Failed to create Mosquitto instance");
+        }
+
+        mosquitto_message_callback_set(mosq_, message_callback);
+
+        if (mosquitto_connect(mosq_, host, port, 60) != MOSQ_ERR_SUCCESS) {
+            mosquitto_destroy(mosq_);
+            throw std::runtime_error("Failed to connect to MQTT broker");
+        }
+
+        if (mosquitto_subscribe(mosq_, nullptr, topic, 1) != MOSQ_ERR_SUCCESS) {
+            mosquitto_destroy(mosq_);
+            throw std::runtime_error("Failed to subscribe to topic");
+        }
+
+        running_ = true;
+        thread_ = std::thread(&MqttGpioReceiver::loop, this);
+    }
+
+    ~MqttGpioReceiver() {
+        running_ = false;
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (mosq_) {
+            mosquitto_destroy(mosq_);
+        }
+        mosquitto_lib_cleanup();
+    }
+
+    std::string get_gpio_data() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!last_gpio_data_.empty()) {
+            std::string data = last_gpio_data_;
+            last_gpio_data_.clear();
+            return data;
+        }
+        return "";
+    }
+
+private:
+    static void message_callback(struct mosquitto* mosq, void* obj,
+                                const struct mosquitto_message* msg) {
+        MqttGpioReceiver* receiver = static_cast<MqttGpioReceiver*>(obj);
+        std::lock_guard<std::mutex> lock(receiver->mutex_);
+        receiver->last_gpio_data_ = std::string((char*)msg->payload, msg->payloadlen);
+        std::cout << "Received command on topic '" << msg->topic << "': " << receiver->last_gpio_data_ << std::endl;
+    }
+
+    void loop() {
+        while (running_) {
+            mosquitto_loop(mosq_, 100, 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    struct mosquitto* mosq_;
+    std::string last_gpio_data_;
+    std::mutex mutex_;
+    std::thread thread_;
+    bool running_;
+};
+
+class GpioProcessor {
+public:
+    GpioProcessor(GPIOController& gpio, MqttGpioReceiver& receiver)
+        : gpio_(gpio), receiver_(receiver) {}
+
+    void run() {
+        std::chrono::steady_clock::time_point last_command_time;
         std::string current_command;
 
-        // Check if manual command is active (within 1 second)
-        if (!last_manual_command.empty() && now - last_manual_time < std::chrono::seconds(1)) {
-            current_command = last_manual_command;
-        } else if (!last_automatic_command.empty()) {
-            current_command = last_automatic_command;
-        } else {
-            current_command = "stop";
-        }
+        while (true) {
+            auto now = std::chrono::steady_clock::now();
+            std::string gpio_data = receiver_.get_gpio_data();
 
-        // Stop if no new command received for 1 second
-        if (now - last_command_time > std::chrono::seconds(1)) {
-            current_command = "stop";
-        }
+            if (!gpio_data.empty()) {
+                current_command = gpio_data;
+                last_command_time = now;
+            }
 
-        // Simulate motor control (uncomment for Raspberry Pi)
-        /*
-        if (current_command == "move_forward" || current_command == "forward") {
-            digitalWrite(0, HIGH); digitalWrite(1, LOW);
-            digitalWrite(2, HIGH); digitalWrite(3, LOW);
-        } else if (current_command == "stop") {
-            digitalWrite(0, LOW); digitalWrite(1, LOW);
-            digitalWrite(2, LOW); digitalWrite(3, LOW);
-        } else if (current_command == "left") {
-            digitalWrite(0, LOW); digitalWrite(1, HIGH);
-            digitalWrite(2, HIGH); digitalWrite(3, LOW);
-        } else if (current_command == "right") {
-            digitalWrite(0, HIGH); digitalWrite(1, LOW);
-            digitalWrite(2, LOW); digitalWrite(3, HIGH);
-        } else if (current_command == "backward") {
-            digitalWrite(0, LOW); digitalWrite(1, HIGH);
-            digitalWrite(2, LOW); digitalWrite(3, HIGH);
-        }
-        */
+            if (current_command.empty() || 
+                now - last_command_time > std::chrono::seconds(1)) {
+                current_command = "stop";
+            }
 
-        // Clear commands after processing
-        if (!last_manual_command.empty() && now - last_manual_time < std::chrono::seconds(1)) {
-            last_manual_command.clear();
-        } else if (!last_automatic_command.empty()) {
-            last_automatic_command.clear();
-        }
+            if (current_command == "forward") {
+                gpio_.forward();
+            } else if (current_command == "backward") {
+                gpio_.backward();
+            } else if (current_command == "left") {
+                gpio_.left();
+            } else if (current_command == "right") {
+                gpio_.right();
+            } else {
+                gpio_.stop();
+            }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
-    // Cleanup
-    mosquitto_loop_stop(mqtt_client, false);
-    mosquitto_destroy(mqtt_client);
-    mosquitto_lib_cleanup();
+private:
+    GPIOController& gpio_;
+    MqttGpioReceiver& receiver_;
+};
+
+int main() {
+    try {
+        GPIOController gpio;
+        MqttGpioReceiver mqtt("192.168.1.100", 1883, "robot/gpio");
+        GpioProcessor processor(gpio, mqtt);
+        processor.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }

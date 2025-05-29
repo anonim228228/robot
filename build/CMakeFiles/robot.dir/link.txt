@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/robot.dir/link.d CMakeFiles/robot.dir/robot.cpp.o -o robot  -Wl,-rpath,/usr/local/lib -lmosquitto /usr/local/lib/libwiringPi.so
